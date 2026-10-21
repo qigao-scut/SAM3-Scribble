@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/hero.svg" alt="SAM3-Scribble — sparse scribbles, text prompts and medical image segmentation" width="100%" />
+# SAM3-Scribble
 
 ### 🧬 Adapting SAM3 to medical imaging with sparse scribble supervision
 
