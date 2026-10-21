@@ -1,0 +1,1647 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates. All Rights Reserved
+
+# pyre-unsafe
+
+import contextlib
+import fnmatch
+import gc
+import json
+import logging
+import math
+import os
+import time
+from collections import OrderedDict
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Mapping, Optional
+
+import numpy as np
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+from hydra.utils import instantiate
+from iopath.common.file_io import g_pathmgr
+from sam3.model.data_misc import BatchedDatapoint
+from sam3.model.model_misc import SAM3Output
+from sam3.model.utils.misc import copy_data_to_device
+
+from sam3.train.optim.optimizer import (
+    construct_optimizer,
+    unix_param_pattern_to_parameter_names,
+)
+
+from sam3.train.utils.checkpoint_utils import (
+    assert_skipped_parameters_are_frozen,
+    exclude_params_matching_unix_pattern,
+    load_state_dict_into_model,
+    with_check_parameter_frozen,
+)
+from sam3.train.utils.distributed import all_reduce_max, barrier, get_rank
+from sam3.train.utils.logger import Logger, setup_logging
+from sam3.train.utils.train_utils import (
+    AverageMeter,
+    collect_dict_keys,
+    DurationMeter,
+    get_amp_type,
+    get_machine_local_and_dist_rank,
+    get_resume_checkpoint,
+    human_readable_time,
+    is_dist_avail_and_initialized,
+    log_env_variables,
+    makedir,
+    MemMeter,
+    Phase,
+    ProgressMeter,
+    set_seeds,
+    setup_distributed_backend,
+)
+
+
+CORE_LOSS_KEY = "core_loss"
+
+
+def unwrap_ddp_if_wrapped(model):
+    if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+        return model.module
+    return model
+
+
+@dataclass
+class OptimAMPConf:
+    enabled: bool = False
+    amp_dtype: str = "float16"
+
+
+@dataclass
+class OptimConf:
+    optimizer: torch.optim.Optimizer = None
+    options: Optional[Dict[str, Any]] = None
+    param_group_modifiers: Optional[List] = None
+    param_allowlist_patterns: Optional[List[str]] = None  # e.g. ["*lora_A*", "*lora_B*"] for LoRA
+    amp: Optional[Dict[str, Any]] = None
+    gradient_clip: Any = None
+    gradient_logger: Any = None
+
+    def __post_init__(self):
+        # amp
+        if not isinstance(self.amp, OptimAMPConf):
+            if self.amp is None:
+                self.amp = {}
+            assert isinstance(self.amp, Mapping)
+            self.amp = OptimAMPConf(**self.amp)
+
+
+@dataclass
+class DistributedConf:
+    backend: Optional[str] = None  # inferred from accelerator type
+    comms_dtype: Optional[str] = None
+    find_unused_parameters: bool = False
+    timeout_mins: int = 30
+    gradient_as_bucket_view: bool = False  # PyTorch DDP default is False
+    static_graph: bool = False  # PyTorch DDP default is False
+
+
+@dataclass
+class CudaConf:
+    cudnn_deterministic: bool = False
+    cudnn_benchmark: bool = True
+    allow_tf32: bool = False
+    # if not None, `matmul_allow_tf32` key will override `allow_tf32` for matmul
+    matmul_allow_tf32: Optional[bool] = None
+    # if not None, `cudnn_allow_tf32` key will override `allow_tf32` for cudnn
+    cudnn_allow_tf32: Optional[bool] = None
+
+
+@dataclass
+class CheckpointConf:
+    save_dir: str
+    save_freq: int
+    save_list: List[int] = field(default_factory=list)
+    model_weight_initializer: Any = None
+    save_best_meters: List[str] = None
+    save_best_combined_meter: Optional[Dict[str, Any]] = None
+    save_best_combined_meters: Optional[List[Dict[str, Any]]] = None
+    skip_saving_parameters: List[str] = field(default_factory=list)
+    initialize_after_preemption: Optional[bool] = None
+    # if not None, training will be resumed from this checkpoint
+    resume_from: Optional[str] = None
+
+    def infer_missing(self):
+        if self.initialize_after_preemption is None:
+            with_skip_saving = len(self.skip_saving_parameters) > 0
+            self.initialize_after_preemption = with_skip_saving
+        return self
+
+
+@dataclass
+class EarlyStoppingConf:
+    enabled: bool = False
+    monitor: str = "val_mean_segmentation_coco_eval_segm_Dice"
+    mode: str = "max"
+    patience: int = 6
+    min_delta: float = 0.002
+    min_epochs: int = 12
+
+
+@dataclass
+class LoggingConf:
+    log_dir: str
+    log_freq: int  # In iterations
+    tensorboard_writer: Any
+    log_level_primary: str = "INFO"
+    log_level_secondary: str = "ERROR"
+    log_scalar_frequency: int = 100
+    log_visual_frequency: int = 100
+    scalar_keys_to_log: Optional[Dict[str, Any]] = None
+    log_batch_stats: bool = False
+    wandb_writer: Optional[Any] = None
+
+
+class Trainer:
+    """
+    Trainer supporting the DDP training strategies.
+    """
+
+    EPSILON = 1e-8
+
+    def __init__(
+        self,
+        *,  # the order of these args can change at any time, so they are keyword-only
+        data: Dict[str, Any],
+        model: Dict[str, Any],
+        logging: Dict[str, Any],
+        checkpoint: Dict[str, Any],
+        max_epochs: int,
+        mode: str = "train",
+        accelerator: str = "cuda",
+        seed_value: int = 123,
+        val_epoch_freq: int = 1,
+        distributed: Dict[str, bool] = None,
+        cuda: Dict[str, bool] = None,
+        env_variables: Optional[Dict[str, Any]] = None,
+        optim: Optional[Dict[str, Any]] = None,
+        optim_overrides: Optional[List[Dict[str, Any]]] = None,
+        meters: Optional[Dict[str, Any]] = None,
+        loss: Optional[Dict[str, Any]] = None,
+        skip_first_val: bool = False,
+        skip_saving_ckpts: bool = False,
+        empty_gpu_mem_cache_after_eval: bool = True,
+        early_stopping: Optional[Dict[str, Any]] = None,
+        gradient_accumulation_steps: int = 1,
+        # 渐进式训练参数
+        enable_progressive_training: bool = False,
+        bbox_update_epoch_interval: int = 5,
+        initial_weak_supervision_epochs: int = 5,
+        # 强监督权重配置
+        strong_loss_bbox_weight: float = 5.0,
+        strong_loss_giou_weight: float = 2.0,
+        strong_matcher_cost_class: float = 2.0,
+        strong_matcher_cost_bbox: float = 5.0,
+        strong_matcher_cost_giou: float = 2.0,
+        # 弱监督权重配置
+        weak_matcher_cost_class: float = 5.0,
+        weak_matcher_cost_bbox: float = 1.0,
+        weak_matcher_cost_giou: float = 1.0,
+    ):
+        self._setup_env_variables(env_variables)
+        self._setup_timers()
+
+        self.data_conf = data
+        self.model_conf = model
+        self.logging_conf = LoggingConf(**logging)
+        self.checkpoint_conf = CheckpointConf(**checkpoint).infer_missing()
+        self.max_epochs = max_epochs
+        self.mode = mode
+        self.val_epoch_freq = val_epoch_freq
+        self.optim_conf = OptimConf(**optim) if optim is not None else OptimConf()
+        self.meters_conf = meters
+        self.loss_conf = loss
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        distributed = DistributedConf(**distributed or {})
+        cuda = CudaConf(**cuda or {})
+        self.where = 0.0
+
+        self.skip_first_val = skip_first_val
+        self.skip_saving_ckpts = skip_saving_ckpts
+        self.empty_gpu_mem_cache_after_eval = empty_gpu_mem_cache_after_eval
+        self.early_stopping_conf = EarlyStoppingConf(**(early_stopping or {}))
+        if self.early_stopping_conf.mode not in ["max", "min"]:
+            raise ValueError(
+                f"Unsupported early stopping mode: {self.early_stopping_conf.mode}"
+            )
+        self.early_stopping_state = {
+            "best": None,
+            "num_bad_validations": 0,
+        }
+        self.early_stop_triggered = False
+        
+        # 渐进式训练参数
+        self.enable_progressive_training = enable_progressive_training
+        self.bbox_update_epoch_interval = bbox_update_epoch_interval
+        self.initial_weak_supervision_epochs = initial_weak_supervision_epochs
+        self._use_strong_supervision = False
+        
+        # 强监督和弱监督的权重配置
+        self.strong_loss_bbox_weight = strong_loss_bbox_weight
+        self.strong_loss_giou_weight = strong_loss_giou_weight
+        self.strong_matcher_cost_class = strong_matcher_cost_class
+        self.strong_matcher_cost_bbox = strong_matcher_cost_bbox
+        self.strong_matcher_cost_giou = strong_matcher_cost_giou
+        self.weak_matcher_cost_class = weak_matcher_cost_class
+        self.weak_matcher_cost_bbox = weak_matcher_cost_bbox
+        self.weak_matcher_cost_giou = weak_matcher_cost_giou
+
+        self._infer_distributed_backend_if_none(distributed, accelerator)
+
+        self._setup_device(accelerator)
+
+        self._setup_torch_dist_and_backend(cuda, distributed)
+
+        makedir(self.logging_conf.log_dir)
+        setup_logging(
+            __name__,
+            output_dir=self.logging_conf.log_dir,
+            rank=self.rank,
+            log_level_primary=self.logging_conf.log_level_primary,
+            log_level_secondary=self.logging_conf.log_level_secondary,
+        )
+
+        set_seeds(seed_value, self.max_epochs, self.distributed_rank)
+        log_env_variables()
+
+        assert is_dist_avail_and_initialized(), (
+            "Torch distributed needs to be initialized before calling the trainer."
+        )
+
+        self._setup_components()  # Except Optimizer everything is setup here.
+        self._move_to_device()
+        self._construct_optimizers()
+        # gaoqi: setup dataloaders
+        self._setup_dataloaders()
+
+        self.time_elapsed_meter = DurationMeter("Time Elapsed", self.device, ":.2f")
+        
+        # gaoqi: resume from checkpoint if specified
+        if self.checkpoint_conf.resume_from is not None:
+            assert os.path.exists(self.checkpoint_conf.resume_from), (
+                f"The 'resume_from' checkpoint {self.checkpoint_conf.resume_from} does not exist!"
+            )
+            dst = os.path.join(self.checkpoint_conf.save_dir, "checkpoint.pt")
+            if self.distributed_rank == 0 and not os.path.exists(dst):
+                # Copy the "resume_from" checkpoint to the checkpoint folder
+                # if there is not a checkpoint to resume from already there
+                makedir(self.checkpoint_conf.save_dir)
+                g_pathmgr.copy(self.checkpoint_conf.resume_from, dst)
+            barrier()
+
+        self.load_checkpoint()
+        self._setup_ddp_distributed_training(distributed, accelerator)
+        barrier()
+
+    def _setup_timers(self):
+        """
+        Initializes counters for elapsed time and eta.
+        """
+        self.start_time = time.time()
+        self.ckpt_time_elapsed = 0
+        self.est_epoch_time = dict.fromkeys([Phase.TRAIN, Phase.VAL], 0)
+
+    def _get_meters(self, phase_filters=None):
+        if self.meters is None:
+            return {}
+        meters = {}
+        for phase, phase_meters in self.meters.items():
+            if phase_filters is not None and phase not in phase_filters:
+                continue
+            for key, key_meters in phase_meters.items():
+                if key_meters is None:
+                    continue
+                for name, meter in key_meters.items():
+                    meters[f"{phase}_{key}/{name}"] = meter
+        return meters
+
+    def _infer_distributed_backend_if_none(self, distributed_conf, accelerator):
+        if distributed_conf.backend is None:
+            distributed_conf.backend = "nccl" if accelerator == "cuda" else "gloo"
+
+    def _setup_env_variables(self, env_variables_conf) -> None:
+        if env_variables_conf is not None:
+            for variable_name, value in env_variables_conf.items():
+                os.environ[variable_name] = value
+
+    def _setup_torch_dist_and_backend(self, cuda_conf, distributed_conf) -> None:
+        if torch.cuda.is_available():
+            torch.backends.cudnn.deterministic = cuda_conf.cudnn_deterministic
+            torch.backends.cudnn.benchmark = cuda_conf.cudnn_benchmark
+            torch.backends.cuda.matmul.allow_tf32 = (
+                cuda_conf.matmul_allow_tf32
+                if cuda_conf.matmul_allow_tf32 is not None
+                else cuda_conf.allow_tf32
+            )
+            torch.backends.cudnn.allow_tf32 = (
+                cuda_conf.cudnn_allow_tf32
+                if cuda_conf.cudnn_allow_tf32 is not None
+                else cuda_conf.allow_tf32
+            )
+
+        self.rank = setup_distributed_backend(
+            distributed_conf.backend, distributed_conf.timeout_mins
+        )
+
+    def _setup_device(self, accelerator):
+        self.local_rank, self.distributed_rank = get_machine_local_and_dist_rank()
+        if accelerator == "cuda":
+            self.device = torch.device("cuda", self.local_rank)
+            torch.cuda.set_device(self.local_rank)
+        elif accelerator == "cpu":
+            self.device = torch.device("cpu")
+        else:
+            raise ValueError(f"Unsupported accelerator: {accelerator}")
+
+    def _setup_ddp_distributed_training(self, distributed_conf, accelerator):
+        assert isinstance(self.model, torch.nn.Module)
+
+        self.model = nn.parallel.DistributedDataParallel(
+            self.model,
+            device_ids=[self.local_rank] if accelerator == "cuda" else [],
+            find_unused_parameters=distributed_conf.find_unused_parameters,
+            gradient_as_bucket_view=distributed_conf.gradient_as_bucket_view,
+            static_graph=distributed_conf.static_graph,
+        )
+        if distributed_conf.comms_dtype is not None:  # noqa
+            from torch.distributed.algorithms import ddp_comm_hooks
+
+            amp_type = get_amp_type(distributed_conf.comms_dtype)
+            if amp_type == torch.bfloat16:
+                hook = ddp_comm_hooks.default_hooks.bf16_compress_hook
+                logging.info("Enabling bfloat16 grad communication")
+            else:
+                hook = ddp_comm_hooks.default_hooks.fp16_compress_hook
+                logging.info("Enabling fp16 grad communication")
+            process_group = None
+            self.model.register_comm_hook(process_group, hook)
+
+    def _move_to_device(self):
+        logging.info(
+            f"Moving components to device {self.device} and local rank {self.local_rank}."
+        )
+
+        self.model.to(self.device)
+
+        logging.info(
+            f"Done moving components to device {self.device} and local rank {self.local_rank}."
+        )
+
+    def save_checkpoint(self, epoch, checkpoint_names=None):
+        if self.skip_saving_ckpts:
+            logging.info(
+                "skip_saving_ckpts is set to True. So, no checkpoints have been saved."
+            )
+            return
+        checkpoint_folder = self.checkpoint_conf.save_dir
+        makedir(checkpoint_folder)
+        if checkpoint_names is None:
+            checkpoint_names = ["checkpoint"]
+            if (
+                self.checkpoint_conf.save_freq > 0
+                and (int(epoch) % self.checkpoint_conf.save_freq == 0)
+            ) or int(epoch) in self.checkpoint_conf.save_list:
+                checkpoint_names.append(f"checkpoint_{int(epoch)}")
+
+        checkpoint_paths = []
+        for ckpt_name in checkpoint_names:
+            checkpoint_paths.append(os.path.join(checkpoint_folder, f"{ckpt_name}.pt"))
+
+        state_dict = unwrap_ddp_if_wrapped(self.model).state_dict()
+        state_dict = exclude_params_matching_unix_pattern(
+            patterns=self.checkpoint_conf.skip_saving_parameters, state_dict=state_dict
+        )
+
+        checkpoint = {
+            "model": state_dict,
+            "optimizer": self.optim.optimizer.state_dict(),
+            "epoch": epoch,
+            "loss": self.loss.state_dict(),
+            "steps": self.steps,
+            "time_elapsed": self.time_elapsed_meter.val,
+            "best_meter_values": self.best_meter_values,
+            "early_stopping_state": self.early_stopping_state,
+        }
+        if self.optim_conf.amp.enabled:
+            checkpoint["scaler"] = self.scaler.state_dict()
+
+        # DDP checkpoints are only saved on rank 0 (all workers are identical)
+        if self.distributed_rank != 0:
+            return
+
+        for checkpoint_path in checkpoint_paths:
+            self._save_checkpoint(checkpoint, checkpoint_path)
+
+    def _save_checkpoint(self, checkpoint, checkpoint_path):
+        """
+        Save a checkpoint while guarding against the job being killed in the middle
+        of checkpoint saving (which corrupts the checkpoint file and ruins the
+        entire training since usually only the last checkpoint is kept per run).
+
+        We first save the new checkpoint to a temp file (with a '.tmp' suffix), and
+        and move it to overwrite the old checkpoint_path.
+        """
+        checkpoint_path_tmp = f"{checkpoint_path}.tmp"
+        with g_pathmgr.open(checkpoint_path_tmp, "wb") as f:
+            torch.save(checkpoint, f)
+        # after torch.save is completed, replace the old checkpoint with the new one
+        if g_pathmgr.exists(checkpoint_path):
+            # remove the old checkpoint_path file first (otherwise g_pathmgr.mv fails)
+            g_pathmgr.rm(checkpoint_path)
+        success = g_pathmgr.mv(checkpoint_path_tmp, checkpoint_path)
+        assert success
+
+    def load_checkpoint(self):
+        ckpt_path = get_resume_checkpoint(self.checkpoint_conf.save_dir)
+        if ckpt_path is None:
+            self._init_model_state()
+        else:
+            if self.checkpoint_conf.initialize_after_preemption:
+                self._call_model_initializer()
+            self._load_resuming_checkpoint(ckpt_path)
+
+    def _init_model_state(self):
+        # Checking that parameters that won't be saved are indeed frozen
+        # We do this check here before even saving the model to catch errors
+        # are early as possible and not at the end of the first epoch
+        assert_skipped_parameters_are_frozen(
+            patterns=self.checkpoint_conf.skip_saving_parameters,
+            model=self.model,
+        )
+
+        # Checking that parameters that won't be saved are initialized from
+        # within the model definition, unless `initialize_after_preemption`
+        # is explicitly set to `True`. If not, this is a bug, and after
+        # preemption, the `skip_saving_parameters` will have random values
+        allow_init_skip_parameters = self.checkpoint_conf.initialize_after_preemption
+        with with_check_parameter_frozen(
+            patterns=self.checkpoint_conf.skip_saving_parameters,
+            model=self.model,
+            disabled=allow_init_skip_parameters,
+        ):
+            self._call_model_initializer()
+
+    def _call_model_initializer(self):
+        model_weight_initializer = instantiate(
+            self.checkpoint_conf.model_weight_initializer
+        )
+        if model_weight_initializer is not None:
+            logging.info(
+                f"Loading pretrained checkpoint from {self.checkpoint_conf.model_weight_initializer}"
+            )
+            self.model = model_weight_initializer(model=self.model)
+
+    def _load_resuming_checkpoint(self, ckpt_path: str):
+        logging.info(f"Resuming training from {ckpt_path}")
+
+        with g_pathmgr.open(ckpt_path, "rb") as f:
+            checkpoint = torch.load(f, map_location="cpu", weights_only=False)
+        load_state_dict_into_model(
+            model=self.model,
+            state_dict=checkpoint["model"],
+            ignore_missing_keys=self.checkpoint_conf.skip_saving_parameters,
+        )
+
+        self.optim.optimizer.load_state_dict(checkpoint["optimizer"])
+        self.loss.load_state_dict(checkpoint["loss"], strict=True)
+        self.epoch = checkpoint["epoch"]
+        self.steps = checkpoint["steps"]
+        self.ckpt_time_elapsed = checkpoint.get("time_elapsed")
+
+        if self.optim_conf.amp.enabled and "scaler" in checkpoint:
+            self.scaler.load_state_dict(checkpoint["scaler"])
+
+        self.best_meter_values = checkpoint.get("best_meter_values", {})
+        self.early_stopping_state = checkpoint.get(
+            "early_stopping_state", self.early_stopping_state
+        )
+
+        if "train_dataset" in checkpoint and self.train_dataset is not None:
+            self.train_dataset.load_checkpoint_state(checkpoint["train_dataset"])
+
+    def is_intermediate_val_epoch(self, epoch):
+        skip_epoch = self.skip_first_val and epoch == 0
+        return (
+            epoch % self.val_epoch_freq == 0
+            and epoch < self.max_epochs - 1
+            and not skip_epoch
+        )
+
+    def _find_loss(self, key: str):
+        if key in self.loss:
+            return self.loss[key]
+
+        assert key != "all", "Loss must be specified for key='all'"
+        assert "default" in self.loss, (
+            f"Key {key} not found in losss, and no default provided"
+        )
+        return self.loss["default"]
+
+    def _find_meter(self, phase: str, key: str):
+        if key in self.meters[phase]:
+            return self.meters[phase][key]
+
+        for cand_key, meter in self.meters[phase].items():
+            if fnmatch.fnmatch(key, cand_key):
+                return meter
+        return None
+    
+    # gaoqi: 模型的核心调用点
+    def _step(
+        self,
+        batch: BatchedDatapoint,
+        model: nn.Module,
+        phase: str,
+    ):
+        key, batch = batch.popitem()
+        batch = copy_data_to_device(batch, self.device, non_blocking=True)
+        # gaoqi: model forward
+        find_stages = model(batch)
+        find_targets = [
+            unwrap_ddp_if_wrapped(model).back_convert(x) for x in batch.find_targets
+        ]
+        batch_size = len(batch.img_batch)
+        loss = self._find_loss(key)(find_stages, find_targets)
+
+        loss_str = f"Losses/{phase}_{key}_loss"
+
+        loss_log_str = os.path.join("Step_Losses", loss_str)
+
+        # loss contains multiple sub-components we wish to log
+        step_losses = {}
+        if isinstance(loss, dict):
+            step_losses.update(
+                {f"Losses/{phase}_{key}_{k}": v for k, v in loss.items()}
+            )
+            loss = self._log_loss_detailed_and_return_core_loss(
+                loss, loss_log_str, self.steps[phase]
+            )
+
+        if self.steps[phase] % self.logging_conf.log_scalar_frequency == 0:
+            self.logger.log(
+                loss_log_str,
+                loss,
+                self.steps[phase],
+            )
+
+        self.steps[phase] += 1
+
+        ret_tuple = {loss_str: loss}, batch_size, step_losses
+
+        if phase not in self.meters:
+            return ret_tuple
+
+        meters_dict = self._find_meter(phase, key)
+        if meters_dict is None:
+            return ret_tuple
+        if meters_dict is not None:
+            for _, meter in meters_dict.items():
+                meter.update(
+                    find_stages=find_stages,
+                    find_metadatas=batch.find_metadatas,
+                    model=model,
+                    batch=batch,
+                    key=key,
+                )
+            # Cleanup memory
+            if isinstance(find_stages, SAM3Output):
+                for fs in find_stages:
+                    for k in list(fs.keys()):
+                        del fs[k]
+
+        return ret_tuple
+
+    def run(self):
+        assert self.mode in ["train", "train_only", "val"]
+        if self.mode == "train":
+            if self.epoch > 0:
+                logging.info(f"Resuming training from epoch: {self.epoch}")
+                # resuming from a checkpoint
+                if self.is_intermediate_val_epoch(self.epoch - 1):
+                    logging.info("Running previous val epoch")
+                    self.epoch -= 1
+                    self.run_val()
+                    self.epoch += 1
+            self.run_train()
+            if not self.early_stop_triggered:
+                self.run_val()
+        elif self.mode == "val":
+            self.run_val()
+        elif self.mode == "train_only":
+            self.run_train()
+
+    def _setup_dataloaders(self):
+        self.train_dataset = None
+        self.val_dataset = None
+
+        if self.mode in ["train", "val"]:
+            self.val_dataset = instantiate(self.data_conf.get(Phase.VAL, None))
+
+        if self.mode in ["train", "train_only"]:
+            self.train_dataset = instantiate(self.data_conf.train)
+
+    def run_train(self):
+        # 检查是否需要启用渐进式训练（推理更新bbox）
+        enable_progressive_training = getattr(self, 'enable_progressive_training', False)
+        bbox_update_epoch_interval = getattr(self, 'bbox_update_epoch_interval', 5)
+        initial_weak_supervision_epochs = getattr(self, 'initial_weak_supervision_epochs', 10)
+        
+        while self.epoch < self.max_epochs:
+            # 检查是否需要更新bbox和调整权重
+            if enable_progressive_training:
+                # 新的bbox更新策略：
+                # - 阶段1结束后（initial_weak_supervision_epochs训练完成后）做一次
+                # - 之后每bbox_update_epoch_interval个epoch更新一次
+                should_update_bbox = False
+                if self.epoch == initial_weak_supervision_epochs:
+                    # 阶段1结束后更新（在开始阶段2之前）
+                    should_update_bbox = True
+                elif self.epoch > initial_weak_supervision_epochs:
+                    # 之后每bbox_update_epoch_interval个epoch更新一次
+                    should_update_bbox = (self.epoch - initial_weak_supervision_epochs) % bbox_update_epoch_interval == 0
+                
+                if should_update_bbox:
+                    # 所有rank都参与推理，每个rank处理一部分数据
+                    logging.info(f"Epoch {self.epoch}: Rank {self.distributed_rank} 开始推理并更新bbox...")
+                    self._run_inference_and_update_bbox()
+                    # 同步到所有进程
+                    barrier()
+                else:
+                    barrier()
+                
+                # 每个epoch都检查并更新权重（因为阶段2中权重是渐进式增加的）
+                self._update_loss_and_matcher_weights()
+            else:
+                barrier()
+            
+            dataloader = self.train_dataset.get_loader(epoch=int(self.epoch))
+            outs = self.train_epoch(dataloader)
+            self.logger.log_dict(outs, self.epoch)  # Logged only on rank 0
+
+            # log train to text file.
+            if self.distributed_rank == 0:
+                with g_pathmgr.open(
+                    os.path.join(self.logging_conf.log_dir, "train_stats.json"),
+                    "a",
+                ) as f:
+                    f.write(json.dumps(outs) + "\n")
+
+            # Save checkpoint before validating
+            self.save_checkpoint(self.epoch + 1)
+
+            del dataloader
+            gc.collect()
+
+            should_stop = False
+            # Run val, not running on last epoch since will run after the
+            # loop anyway
+            if self.is_intermediate_val_epoch(self.epoch):
+                val_outs = self.run_val()
+                should_stop = self._should_stop_early(val_outs)
+                if torch.cuda.is_available() and self.empty_gpu_mem_cache_after_eval:
+                    # release memory buffers held by the model during eval (which typically
+                    # involves a lot more frames in video grounding that during training)
+                    torch.cuda.empty_cache()
+
+            if self.distributed_rank == 0:
+                self.best_meter_values.update(self._get_trainer_state("train"))
+                with g_pathmgr.open(
+                    os.path.join(self.logging_conf.log_dir, "best_stats.json"),
+                    "a",
+                ) as f:
+                    f.write(json.dumps(self.best_meter_values) + "\n")
+
+            if should_stop:
+                logging.info(
+                    "Early stopping triggered at epoch %s.",
+                    self.epoch,
+                )
+                self.early_stop_triggered = True
+                break
+
+            self.epoch += 1
+        # epoch was incremented in the loop but the val step runs out of the loop
+        if not self.early_stop_triggered:
+            self.epoch -= 1
+
+    def _run_inference_and_update_bbox(self):
+        """
+        在训练集上运行推理, 获取分割结果并更新bbox缓存
+        使用分布式推理, 每个rank处理一部分数据
+        """
+        from sam3.train.utils.inference_for_bbox_update import run_inference_on_training_dataset_v2_distributed
+        
+        # 获取模型（去掉DDP包装）
+        model = unwrap_ddp_if_wrapped(self.model)
+        model.eval()
+        
+        # 获取训练数据集
+        train_dataset_wrapper = self.train_dataset # <sam3.train.data.torch_dataset.TorchDataset object at 0x7f810c667260>
+        if hasattr(train_dataset_wrapper, 'dataset'):
+            if isinstance(train_dataset_wrapper.dataset, torch.utils.data.ConcatDataset): # √
+                datasets = train_dataset_wrapper.dataset.datasets
+            else:
+                datasets = [train_dataset_wrapper.dataset]
+        else:
+            datasets = [train_dataset_wrapper]
+        
+        # 对每个数据集运行分布式推理
+        for dataset in datasets:
+            if not isinstance(dataset, torch.utils.data.Dataset):
+                continue
+            
+            # 检查是否是Sam3ImageDataset
+            if not hasattr(dataset, 'update_inferred_bbox_cache'):
+                continue
+            
+            # 为每个数据集单独获取类别信息
+            categories = []
+            if hasattr(dataset, 'coco') and dataset.coco is not None:
+                coco_obj = dataset.coco
+                # COCO_FROM_JSON 对象使用 _cat_idx_to_text 存储类别信息
+                if hasattr(coco_obj, '_cat_idx_to_text'):
+                    # 将 _cat_idx_to_text 转换为 categories 格式
+                    # _cat_idx_to_text 的值可能是字符串（单个名称）或列表（多个名称）
+                    for cat_id, cat_name in coco_obj._cat_idx_to_text.items():
+                        # 如果是列表，取第一个名称；如果是字符串，直接使用
+                        if isinstance(cat_name, list):
+                            name = cat_name[0] if len(cat_name) > 0 else f"category_{cat_id}"
+                        else:
+                            name = cat_name
+                        categories.append({"id": cat_id, "name": name})
+                # 如果是标准的 pycocotools.coco.COCO 对象，使用原有方法
+                elif hasattr(coco_obj, 'loadCats') and hasattr(coco_obj, 'getCatIds'):
+                    categories = coco_obj.loadCats(coco_obj.getCatIds())
+            
+            if not categories:
+                logging.warning(f"Rank {self.distributed_rank}: 数据集 {dataset.annFile} 无法获取类别信息，跳过推理")
+                continue
+            
+            logging.info(f"Rank {self.distributed_rank}: 对数据集 {dataset.annFile} 进行推理... (类别数: {len(categories)})")
+            
+            # 运行分布式推理
+            bbox_cache_dict = run_inference_on_training_dataset_v2_distributed(
+                model=model,
+                train_dataset=dataset,
+                categories=categories,
+                device=str(self.device),
+                confidence_threshold=0.5,
+                rank=self.distributed_rank,
+                world_size=dist.get_world_size() if dist.is_initialized() else 1,
+            )
+            
+            # 更新bbox缓存（每个rank更新自己处理的部分）
+            if dataset.annFile in bbox_cache_dict:
+                bbox_cache = bbox_cache_dict[dataset.annFile]
+                # 转换annotation_id从字符串到整数
+                bbox_cache_int = {int(k): v for k, v in bbox_cache.items()}
+                dataset.update_inferred_bbox_cache(bbox_cache_int)
+        
+        # 同步所有rank的bbox缓存更新
+        if dist.is_initialized():
+            barrier()
+            # Rank 0收集所有rank的结果并广播（如果需要的话）
+            # 由于每个rank已经更新了自己处理的部分，这里只需要同步即可
+        
+        model.train()  # 恢复训练模式
+    
+    # def _update_loss_and_matcher_weights(self, use_strong_supervision: bool):
+    #     """
+    #     动态调整loss权重和matcher权重
+        
+    #     Args:
+    #         use_strong_supervision: 是否使用强监督（True=使用推理得到的bbox，False=使用scribble的bbox）
+    #     """
+    #     # 获取loss配置
+    #     loss_key = "all"  # 根据配置调整
+    #     if loss_key not in self.loss:
+    #         logging.warning(f"Loss key '{loss_key}' not found, skipping weight update")
+    #         return
+        
+    #     loss_wrapper = self.loss[loss_key]
+    #     if not hasattr(loss_wrapper, 'loss_fns_find'):
+    #         logging.warning("Loss wrapper doesn't have loss_fns_find attribute")
+    #         return
+        
+    #     # 更新Boxes loss的权重（只有Boxes loss_fn应该有loss_bbox和loss_giou）
+    #     from sam3.train.loss.loss_fns import Boxes
+    #     for loss_fn in loss_wrapper.loss_fns_find:
+    #         # 只更新Boxes类型的loss_fn
+    #         if isinstance(loss_fn, Boxes) and hasattr(loss_fn, 'weight_dict') and isinstance(loss_fn.weight_dict, dict):
+    #             if use_strong_supervision:
+    #                 # 强监督：使用正常权重
+    #                 loss_fn.weight_dict['loss_bbox'] = getattr(self, 'strong_loss_bbox_weight', 5.0)
+    #                 loss_fn.weight_dict['loss_giou'] = getattr(self, 'strong_loss_giou_weight', 2.0)
+    #             else:
+    #                 # 弱监督：bbox loss权重为0
+    #                 loss_fn.weight_dict['loss_bbox'] = 0.0
+    #                 loss_fn.weight_dict['loss_giou'] = 0.0
+    #             logging.info(f"Updated Boxes loss weights: {loss_fn.weight_dict}")
+        
+    #     # 更新Matcher的权重
+    #     if hasattr(loss_wrapper, 'matcher') and loss_wrapper.matcher is not None:
+    #         if use_strong_supervision:
+    #             # 强监督：使用正常权重
+    #             loss_wrapper.matcher.cost_class = getattr(self, 'strong_matcher_cost_class', 2.0)
+    #             loss_wrapper.matcher.cost_bbox = getattr(self, 'strong_matcher_cost_bbox', 5.0)
+    #             loss_wrapper.matcher.cost_giou = getattr(self, 'strong_matcher_cost_giou', 2.0)
+    #         else:
+    #             # 弱监督：降低bbox权重，提高分类权重
+    #             loss_wrapper.matcher.cost_class = getattr(self, 'weak_matcher_cost_class', 5.0)
+    #             loss_wrapper.matcher.cost_bbox = getattr(self, 'weak_matcher_cost_bbox', 1.0)
+    #             loss_wrapper.matcher.cost_giou = getattr(self, 'weak_matcher_cost_giou', 1.0)
+    #         logging.info(f"Updated Matcher weights: cost_class={loss_wrapper.matcher.cost_class}, "
+    #                     f"cost_bbox={loss_wrapper.matcher.cost_bbox}, cost_giou={loss_wrapper.matcher.cost_giou}")
+    def _update_loss_and_matcher_weights(self):
+        """
+        动态调整loss权重和matcher权重 (新的渐进式策略)
+        
+        阶段1：纯弱监督预热（epoch 0 到 initial_weak_supervision_epochs-1）
+            - loss_bbox: 0.0, loss_giou: 0.0
+            - matcher权重：cost_class: 5.0, cost_bbox: 0.0, cost_giou: 0.0
+        
+        阶段2：渐进式爬坡（从 initial_weak_supervision_epochs 开始）
+            - matcher权重恢复为：cost_class: 5.0, cost_bbox: 1.0, cost_giou: 1.0
+            - 从阶段2开始，loss_bbox=0.2, loss_giou=0.1
+            - 每bbox_update_epoch_interval个epoch提升一次：loss_bbox += 0.3, loss_giou += 0.2
+            - 最终loss_bbox=2.0, loss_giou=1.0
+        """
+        current_epoch = self.epoch
+        initial_weak_supervision_epochs = getattr(self, 'initial_weak_supervision_epochs', 10)
+        bbox_update_epoch_interval = getattr(self, 'bbox_update_epoch_interval', 5)
+        
+        # === 阶段1：纯弱监督预热 ===
+        if current_epoch < initial_weak_supervision_epochs:
+            target_w = {
+                'loss_bbox': 0.0,
+                'loss_giou': 0.0,
+                'cost_class': 5.0,
+                'cost_bbox': 0.0,
+                'cost_giou': 0.0
+            }
+            phase_name = f"阶段1：纯弱监督预热 (epoch 0-{initial_weak_supervision_epochs-1})"
+        
+        # === 阶段2：渐进式爬坡 ===
+        else:
+            # matcher权重恢复为正常值
+            cost_class = 5.0
+            cost_bbox = 1.0
+            cost_giou = 1.0
+            
+            # 计算loss权重：从阶段2开始，每bbox_update_epoch_interval个epoch增加一次
+            # 例如：initial_weak_supervision_epochs=10, bbox_update_epoch_interval=5
+            # epoch 10: loss_bbox=0.2, loss_giou=0.1
+            # epoch 15: loss_bbox=0.5, loss_giou=0.3
+            # epoch 20: loss_bbox=0.8, loss_giou=0.5
+            # ...
+            # epoch 40: loss_bbox=2.0, loss_giou=1.0 (达到最终值)
+            
+            epochs_since_stage2 = current_epoch - initial_weak_supervision_epochs
+            num_increments = epochs_since_stage2 // bbox_update_epoch_interval  # 每bbox_update_epoch_interval个epoch增加一次
+            
+            # 初始值
+            loss_bbox = 0.2
+            loss_giou = 0.1
+            
+            # 每次增加
+            loss_bbox += num_increments * 0.3
+            loss_giou += num_increments * 0.2
+            
+            # 限制最大值
+            loss_bbox = min(loss_bbox, 2.0)
+            loss_giou = min(loss_giou, 1.0)
+            
+            target_w = {
+                'loss_bbox': loss_bbox,
+                'loss_giou': loss_giou,
+                'cost_class': cost_class,
+                'cost_bbox': cost_bbox,
+                'cost_giou': cost_giou
+            }
+            phase_name = f"阶段2：渐进式爬坡 (增量次数: {num_increments})"
+
+        # === 应用权重到 Loss ===
+        loss_key = "all"
+        if loss_key in self.loss:
+            loss_wrapper = self.loss[loss_key]
+            
+            # 1. 更新 Boxes Loss 权重
+            if hasattr(loss_wrapper, 'loss_fns_find'):
+                from sam3.train.loss.loss_fns import Boxes
+                for loss_fn in loss_wrapper.loss_fns_find:
+                    if isinstance(loss_fn, Boxes):
+                        loss_fn.weight_dict['loss_bbox'] = target_w['loss_bbox']
+                        loss_fn.weight_dict['loss_giou'] = target_w['loss_giou']
+                        logging.info(f"Epoch {current_epoch}: [{phase_name}] 更新Loss权重: bbox={target_w['loss_bbox']:.3f}, giou={target_w['loss_giou']:.3f}")
+
+            # 2. 更新 Matcher 权重
+            if hasattr(loss_wrapper, 'matcher') and loss_wrapper.matcher is not None:
+                loss_wrapper.matcher.cost_class = target_w['cost_class']
+                loss_wrapper.matcher.cost_bbox = target_w['cost_bbox']
+                loss_wrapper.matcher.cost_giou = target_w['cost_giou']
+                logging.info(f"Epoch {current_epoch}: [{phase_name}] 更新Matcher权重: class={target_w['cost_class']}, bbox={target_w['cost_bbox']}, giou={target_w['cost_giou']}")
+    def run_val(self):
+        if not self.val_dataset:
+            return None
+
+        dataloader = self.val_dataset.get_loader(epoch=int(self.epoch))
+        outs = self.val_epoch(dataloader, phase=Phase.VAL)
+        del dataloader
+        gc.collect()
+        self.logger.log_dict(outs, self.epoch)  # Logged only on rank 0
+
+        if self.distributed_rank == 0:
+            with g_pathmgr.open(
+                os.path.join(self.logging_conf.log_dir, "val_stats.json"),
+                "a",
+            ) as f:
+                f.write(json.dumps(outs) + "\n")
+        return outs
+
+    def _should_stop_early(self, val_outs: Optional[Dict[str, Any]]) -> bool:
+        conf = self.early_stopping_conf
+        stop = False
+        if self.distributed_rank == 0 and conf.enabled:
+            monitor_key = os.path.join("Meters_train", conf.monitor)
+            monitor_value = None if val_outs is None else val_outs.get(monitor_key)
+            if monitor_value is None:
+                logging.warning(
+                    "Early stopping monitor %s not found in validation outputs.",
+                    monitor_key,
+                )
+            else:
+                monitor_value = float(monitor_value)
+                best = self.early_stopping_state.get("best")
+                improved = (
+                    best is None
+                    or (conf.mode == "max" and monitor_value > best + conf.min_delta)
+                    or (conf.mode == "min" and monitor_value < best - conf.min_delta)
+                )
+                if improved:
+                    self.early_stopping_state["best"] = monitor_value
+                    self.early_stopping_state["num_bad_validations"] = 0
+                    logging.info(
+                        "Early stopping monitor improved: %s=%s",
+                        conf.monitor,
+                        monitor_value,
+                    )
+                else:
+                    self.early_stopping_state["num_bad_validations"] += 1
+                    logging.info(
+                        "Early stopping monitor did not improve: %s=%s, best=%s, bad_validations=%s/%s",
+                        conf.monitor,
+                        monitor_value,
+                        best,
+                        self.early_stopping_state["num_bad_validations"],
+                        conf.patience,
+                    )
+                stop = (
+                    int(self.epoch) >= conf.min_epochs
+                    and self.early_stopping_state["num_bad_validations"]
+                    >= conf.patience
+                )
+
+        if is_dist_avail_and_initialized():
+            stop_tensor = torch.tensor(
+                [int(stop)], dtype=torch.int, device=self.device
+            )
+            dist.broadcast(stop_tensor, src=0)
+            stop = bool(stop_tensor.item())
+        return stop
+
+    def val_epoch(self, val_loader, phase):
+        batch_time = AverageMeter("Batch Time", self.device, ":.2f")
+        data_time = AverageMeter("Data Time", self.device, ":.2f")
+        mem = MemMeter("Mem (GB)", self.device, ":.2f")
+
+        iters_per_epoch = len(val_loader)
+
+        curr_phases = [phase]
+        curr_models = [self.model]
+
+        loss_names = []
+        for p in curr_phases:
+            for key in self.loss.keys():
+                loss_names.append(f"Losses/{p}_{key}_loss")
+
+        loss_mts = OrderedDict(
+            [(name, AverageMeter(name, self.device, ":.2e")) for name in loss_names]
+        )
+        extra_loss_mts = {}
+
+        for model in curr_models:
+            model.eval()
+            if hasattr(unwrap_ddp_if_wrapped(model), "on_validation_epoch_start"):
+                unwrap_ddp_if_wrapped(model).on_validation_epoch_start()
+
+        progress = ProgressMeter(
+            iters_per_epoch,
+            [batch_time, data_time, mem, self.time_elapsed_meter, *loss_mts.values()],
+            self._get_meters(curr_phases),
+            prefix="Val Epoch: [{}]".format(self.epoch),
+        )
+
+        end = time.time()
+
+        for data_iter, batch in enumerate(val_loader):
+            # measure data loading time
+            data_time.update(time.time() - end)
+
+            # batch = batch.to(self.device, non_blocking=True)
+
+            # compute output
+            with torch.no_grad():
+                with torch.amp.autocast(
+                    device_type="cuda",
+                    enabled=(self.optim_conf.amp.enabled if self.optim_conf else False),
+                    dtype=(
+                        get_amp_type(self.optim_conf.amp.amp_dtype)
+                        if self.optim_conf
+                        else None
+                    ),
+                ):
+                    for phase, model in zip(curr_phases, curr_models):
+                        loss_dict, batch_size, extra_losses = self._step(
+                            batch,
+                            model,
+                            phase,
+                        )
+
+                        assert len(loss_dict) == 1
+                        loss_key, loss = loss_dict.popitem()
+
+                        if loss_key in loss_mts:
+                            loss_mts[loss_key].update(loss.item(), batch_size)
+
+                        for k, v in extra_losses.items():
+                            if k not in extra_loss_mts:
+                                extra_loss_mts[k] = AverageMeter(k, self.device, ":.2e")
+                            extra_loss_mts[k].update(v.item(), batch_size)
+
+            # measure elapsed time
+            batch_time.update(time.time() - end)
+            end = time.time()
+
+            self.time_elapsed_meter.update(
+                time.time() - self.start_time + self.ckpt_time_elapsed
+            )
+
+            if torch.cuda.is_available():
+                mem.update(reset_peak_usage=True)
+
+            if data_iter % self.logging_conf.log_freq == 0:
+                progress.display(data_iter)
+
+            if data_iter % self.logging_conf.log_scalar_frequency == 0:
+                # Log progress meters.
+                for progress_meter in progress.meters:
+                    self.logger.log(
+                        os.path.join("Step_Stats", phase, progress_meter.name),
+                        progress_meter.val,
+                        self.steps[Phase.VAL],
+                    )
+
+            if data_iter % 10 == 0:
+                dist.barrier()
+
+        self.est_epoch_time[phase] = batch_time.avg * iters_per_epoch
+        self._log_timers(phase)
+        for model in curr_models:
+            if hasattr(unwrap_ddp_if_wrapped(model), "on_validation_epoch_end"):
+                unwrap_ddp_if_wrapped(model).on_validation_epoch_end()
+
+        out_dict = self._log_meters_and_save_best_ckpts(curr_phases)
+
+        for k, v in loss_mts.items():
+            out_dict[k] = v.avg
+        for k, v in extra_loss_mts.items():
+            out_dict[k] = v.avg
+
+        for phase in curr_phases:
+            out_dict.update(self._get_trainer_state(phase))
+        self._reset_meters(curr_phases)
+        logging.info(f"Meters: {out_dict}")
+        return out_dict
+
+    def _get_trainer_state(self, phase):
+        return {
+            "Trainer/where": self.where,
+            "Trainer/epoch": self.epoch,
+            f"Trainer/steps_{phase}": self.steps[phase],
+        }
+
+    def train_epoch(self, train_loader):
+        # Init stat meters
+        batch_time_meter = AverageMeter("Batch Time", self.device, ":.2f")
+        data_time_meter = AverageMeter("Data Time", self.device, ":.2f")
+        mem_meter = MemMeter("Mem (GB)", self.device, ":.2f")
+        data_times = []
+        phase = Phase.TRAIN
+
+        iters_per_epoch = len(train_loader)
+
+        loss_names = []
+        for batch_key in self.loss.keys():
+            loss_names.append(f"Losses/{phase}_{batch_key}_loss")
+
+        loss_mts = OrderedDict(
+            [(name, AverageMeter(name, self.device, ":.2e")) for name in loss_names]
+        )
+        extra_loss_mts = {}
+
+        progress = ProgressMeter(
+            iters_per_epoch,
+            [
+                batch_time_meter,
+                data_time_meter,
+                mem_meter,
+                self.time_elapsed_meter,
+                *loss_mts.values(),
+            ],
+            self._get_meters([phase]),
+            prefix="Train Epoch: [{}]".format(self.epoch),
+        )
+
+        # Model training loop
+        self.model.train()
+        end = time.time()
+
+        for data_iter, batch in enumerate(train_loader):
+            # measure data loading time
+            data_time_meter.update(time.time() - end)
+            data_times.append(data_time_meter.val)
+            # batch = batch.to(
+            #     self.device, non_blocking=True
+            # )  # move tensors in a tensorclass
+
+
+            try:
+                self._run_step(batch, phase, loss_mts, extra_loss_mts)
+
+                # compute gradient and do optim step
+                exact_epoch = self.epoch + float(data_iter) / iters_per_epoch
+                self.where = float(exact_epoch) / self.max_epochs
+                assert self.where <= 1 + self.EPSILON
+                if self.where < 1.0:
+                    self.optim.step_schedulers(
+                        self.where, step=int(exact_epoch * iters_per_epoch)
+                    )
+                else:
+                    logging.warning(
+                        f"Skipping scheduler update since the training is at the end, i.e, {self.where} of [0,1]."
+                    )
+
+                # Log schedulers
+                if data_iter % self.logging_conf.log_scalar_frequency == 0:
+                    for j, param_group in enumerate(self.optim.optimizer.param_groups):
+                        for option in self.optim.schedulers[j]:
+                            optim_prefix = (
+                                "" + f"{j}_"
+                                if len(self.optim.optimizer.param_groups) > 1
+                                else ""
+                            )
+                            self.logger.log(
+                                os.path.join("Optim", f"{optim_prefix}", option),
+                                param_group[option],
+                                self.steps[phase],
+                            )
+
+                # Clipping gradients and detecting diverging gradients
+                if self.gradient_clipper is not None:
+                    self.scaler.unscale_(self.optim.optimizer)
+                    self.gradient_clipper(model=self.model)
+
+                if self.gradient_logger is not None:
+                    self.gradient_logger(
+                        self.model, rank=self.distributed_rank, where=self.where
+                    )
+
+                # Optimizer step: the scaler will make sure gradients are not
+                # applied if the gradients are infinite
+                self.scaler.step(self.optim.optimizer)
+                self.scaler.update()
+
+                # measure elapsed time
+                batch_time_meter.update(time.time() - end)
+                end = time.time()
+
+                self.time_elapsed_meter.update(
+                    time.time() - self.start_time + self.ckpt_time_elapsed
+                )
+
+                mem_meter.update(reset_peak_usage=True)
+                if data_iter % self.logging_conf.log_freq == 0:
+                    progress.display(data_iter)
+
+                if data_iter % self.logging_conf.log_scalar_frequency == 0:
+                    # Log progress meters.
+                    for progress_meter in progress.meters:
+                        self.logger.log(
+                            os.path.join("Step_Stats", phase, progress_meter.name),
+                            progress_meter.val,
+                            self.steps[phase],
+                        )
+
+            # Catching NaN/Inf errors in the loss
+            except FloatingPointError as e:
+                raise e
+
+        self.est_epoch_time[Phase.TRAIN] = batch_time_meter.avg * iters_per_epoch
+        self._log_timers(Phase.TRAIN)
+        self._log_sync_data_times(Phase.TRAIN, data_times)
+
+        out_dict = self._log_meters_and_save_best_ckpts([Phase.TRAIN])
+
+        for k, v in loss_mts.items():
+            out_dict[k] = v.avg
+        for k, v in extra_loss_mts.items():
+            out_dict[k] = v.avg
+        out_dict.update(self._get_trainer_state(phase))
+        logging.info(f"Losses and meters: {out_dict}")
+        self._reset_meters([phase])
+        return out_dict
+
+    def _log_sync_data_times(self, phase, data_times):
+        data_times = all_reduce_max(torch.tensor(data_times)).tolist()
+        steps = range(self.steps[phase] - len(data_times), self.steps[phase])
+        for step, data_time in zip(steps, data_times):
+            if step % self.logging_conf.log_scalar_frequency == 0:
+                self.logger.log(
+                    os.path.join("Step_Stats", phase, "Data Time Synced"),
+                    data_time,
+                    step,
+                )
+
+    def _run_step(
+        self,
+        batch: BatchedDatapoint,
+        phase: str,
+        loss_mts: Dict[str, AverageMeter],
+        extra_loss_mts: Dict[str, AverageMeter],
+        raise_on_error: bool = True,
+    ):
+        """
+        Run the forward / backward
+        """
+
+        # it's important to set grads to None, especially with Adam since 0
+        # grads will also update a model even if the step doesn't produce
+        # gradients
+        self.optim.zero_grad(set_to_none=True)
+
+        if self.gradient_accumulation_steps > 1:
+            assert isinstance(batch, list), (
+                f"Expected a list of batches, got {type(batch)}"
+            )
+            assert len(batch) == self.gradient_accumulation_steps, (
+                f"Expected {self.gradient_accumulation_steps} batches, got {len(batch)}"
+            )
+            accum_steps = len(batch)
+        else:
+            accum_steps = 1
+            batch = [batch]
+
+        for i, chunked_batch in enumerate(batch):
+            ddp_context = (
+                self.model.no_sync()
+                if i < accum_steps - 1
+                else contextlib.nullcontext()
+            )
+            with ddp_context:
+                with torch.amp.autocast(
+                    device_type="cuda",
+                    enabled=self.optim_conf.amp.enabled,
+                    dtype=get_amp_type(self.optim_conf.amp.amp_dtype),
+                ):
+                    loss_dict, batch_size, extra_losses = self._step(
+                        chunked_batch,
+                        self.model,
+                        phase,
+                    )
+
+                assert len(loss_dict) == 1
+                loss_key, loss = loss_dict.popitem()
+
+                if not math.isfinite(loss.item()):
+                    error_msg = f"Loss is {loss.item()}, attempting to stop training"
+                    logging.error(error_msg)
+                    if raise_on_error:
+                        raise FloatingPointError(error_msg)
+                    else:
+                        return
+
+                self.scaler.scale(loss).backward()
+                loss_mts[loss_key].update(loss.item(), batch_size)
+                for extra_loss_key, extra_loss in extra_losses.items():
+                    if extra_loss_key not in extra_loss_mts:
+                        extra_loss_mts[extra_loss_key] = AverageMeter(
+                            extra_loss_key, self.device, ":.2e"
+                        )
+                    extra_loss_mts[extra_loss_key].update(extra_loss.item(), batch_size)
+
+    def _log_meters_and_save_best_ckpts(self, phases: List[str]):
+        logging.info("Synchronizing meters")
+        out_dict = {}
+        checkpoint_save_keys = []
+        current_meter_values = {}
+        for key, meter in self._get_meters(phases).items():
+            meter_output = meter.compute_synced()
+
+            # gaoqi: --- 手动处理 is_better 缺失的情况 (保持你原有的逻辑) ---
+            is_better_check = getattr(meter, "is_better", None)
+            if is_better_check is None:
+                if self.checkpoint_conf.save_best_meters is not None and key in self.checkpoint_conf.save_best_meters:
+                    def default_is_better(new_val, old_val):
+                        return new_val > old_val
+                    is_better_check = default_is_better
+            # -----------------------------------------------------------
+            for meter_subkey, meter_value in meter_output.items():
+                out_dict[os.path.join("Meters_train", key, meter_subkey)] = meter_value
+                tracked_meter_key = os.path.join(key, meter_subkey)
+                current_meter_values[tracked_meter_key] = meter_value
+
+                if is_better_check is None:
+                    continue
+
+                # 检查是否打破纪录
+                if tracked_meter_key not in self.best_meter_values or is_better_check(
+                    meter_value,
+                    self.best_meter_values[tracked_meter_key],
+                ):
+                    # 1. 首先更新内部的最佳值记录 (对所有指标都执行，确保记录是最新的)
+                    self.best_meter_values[tracked_meter_key] = meter_value
+
+                    # 2. 检查是否在配置的保存列表中
+                    if (
+                        self.checkpoint_conf.save_best_meters is not None
+                        and key in self.checkpoint_conf.save_best_meters
+                    ):
+                        # gaoqi: --- 修改开始：仅针对特定核心指标打印日志并保存 ---
+                        
+                        # 定义你关心的核心指标列表
+                        target_subkeys = ["coco_eval_segm_AP", "coco_eval_bbox_AP"]
+
+                        if meter_subkey in target_subkeys:
+                            # 只有这两个指标变好时，才打印日志
+                            logging.info(f"New best found for {tracked_meter_key}: {meter_value}")
+                            
+                            # 添加到保存列表
+                            checkpoint_save_keys.append(tracked_meter_key.replace("/", "_"))
+                        
+                        # --- 修改结束 ---
+
+        combined_confs = []
+        if self.checkpoint_conf.save_best_combined_meter is not None:
+            combined_confs.append(self.checkpoint_conf.save_best_combined_meter)
+        if self.checkpoint_conf.save_best_combined_meters is not None:
+            combined_confs.extend(self.checkpoint_conf.save_best_combined_meters)
+
+        for combined_conf in combined_confs:
+            if self.distributed_rank == 0:
+                metric_keys = combined_conf.get("metric_keys", [])
+                missing_keys = [k for k in metric_keys if k not in current_meter_values]
+                if missing_keys:
+                    logging.warning(
+                        "Skipping combined best checkpoint because metrics are missing: %s",
+                        missing_keys,
+                    )
+                else:
+                    combined_name = combined_conf.get("name", "combined_metric")
+                    combined_mode = combined_conf.get("mode", "max")
+                    if combined_mode not in ["max", "min"]:
+                        raise ValueError(
+                            f"Unsupported combined best meter mode: {combined_mode}"
+                        )
+                    values = [current_meter_values[k] for k in metric_keys]
+                    combined_value = sum(values) / len(values)
+                    out_dict[os.path.join("Meters_train", combined_name)] = combined_value
+
+                    old_value = self.best_meter_values.get(combined_name)
+                    is_better = (
+                        old_value is None
+                        or (combined_mode == "max" and combined_value > old_value)
+                        or (combined_mode == "min" and combined_value < old_value)
+                    )
+                    if is_better:
+                        self.best_meter_values[combined_name] = combined_value
+                        logging.info(
+                            "New best found for %s: %s from %s",
+                            combined_name,
+                            combined_value,
+                            dict(zip(metric_keys, values)),
+                        )
+                        checkpoint_save_keys.append(combined_name.replace("/", "_"))
+
+        # 执行保存
+        if len(checkpoint_save_keys) > 0:
+            logging.info(f"Saving best checkpoints for: {checkpoint_save_keys}")
+            self.save_checkpoint(self.epoch + 1, checkpoint_save_keys)
+
+        return out_dict
+
+    def _log_timers(self, phase):
+        time_remaining = 0
+        epochs_remaining = self.max_epochs - self.epoch - 1
+        val_epochs_remaining = sum(
+            n % self.val_epoch_freq == 0 for n in range(self.epoch, self.max_epochs)
+        )
+
+        # Adding the guaranteed val run at the end if val_epoch_freq doesn't coincide with
+        # the end epoch.
+        if (self.max_epochs - 1) % self.val_epoch_freq != 0:
+            val_epochs_remaining += 1
+
+        # Remove the current val run from estimate
+        if phase == Phase.VAL:
+            val_epochs_remaining -= 1
+
+        time_remaining += (
+            epochs_remaining * self.est_epoch_time[Phase.TRAIN]
+            + val_epochs_remaining * self.est_epoch_time[Phase.VAL]
+        )
+
+        self.logger.log(
+            os.path.join("Step_Stats", phase, self.time_elapsed_meter.name),
+            self.time_elapsed_meter.val,
+            self.steps[phase],
+        )
+
+        logging.info(f"Estimated time remaining: {human_readable_time(time_remaining)}")
+
+    def _reset_meters(self, phases: str) -> None:
+        for meter in self._get_meters(phases).values():
+            meter.reset()
+
+    def _check_val_key_match(self, val_keys, phase):
+        if val_keys is not None:
+            # Check if there are any duplicates
+            assert len(val_keys) == len(set(val_keys)), (
+                f"Duplicate keys in val datasets, keys: {val_keys}"
+            )
+
+            # Check that the keys match the meter keys
+            if self.meters_conf is not None and phase in self.meters_conf:
+                assert set(val_keys) == set(self.meters_conf[phase].keys()), (
+                    f"Keys in val datasets do not match the keys in meters."
+                    f"\nMissing in meters: {set(val_keys) - set(self.meters_conf[phase].keys())}"
+                    f"\nMissing in val datasets: {set(self.meters_conf[phase].keys()) - set(val_keys)}"
+                )
+
+            if self.loss_conf is not None:
+                loss_keys = set(self.loss_conf.keys()) - set(["all"])
+                if "default" not in loss_keys:
+                    for k in val_keys:
+                        assert k in loss_keys, (
+                            f"Error: key {k} is not defined in the losses, and no default is set"
+                        )
+
+    def _setup_components(self):
+        # Get the keys for all the val datasets, if any
+        val_phase = Phase.VAL
+        val_keys = None
+        if self.data_conf.get(val_phase, None) is not None:
+            val_keys = collect_dict_keys(self.data_conf[val_phase])
+        # Additional checks on the sanity of the config for val datasets
+        self._check_val_key_match(val_keys, phase=val_phase)
+
+        logging.info("Setting up components: Model, loss, optim, meters etc.")
+        self.epoch = 0
+        self.steps = {Phase.TRAIN: 0, Phase.VAL: 0}
+
+        self.logger = Logger(self.logging_conf)
+        # gaoqi: setup model
+        self.model = instantiate(self.model_conf, _convert_="all")
+        print_model_summary(self.model)
+        
+        # gaoqi: setup loss
+        self.loss = None
+        if self.loss_conf:
+            self.loss = {
+                key: el  # wrap_base_loss(el)
+                for (key, el) in instantiate(self.loss_conf, _convert_="all").items()
+            }
+            self.loss = nn.ModuleDict(self.loss)
+        
+        # gaoqi: setup meters
+        self.meters = {}
+        self.best_meter_values = {}
+        if self.meters_conf:
+            self.meters = instantiate(self.meters_conf, _convert_="all")
+
+        self.scaler = torch.amp.GradScaler(
+            self.device,
+            enabled=self.optim_conf.amp.enabled if self.optim_conf else False,
+        )
+
+        self.gradient_clipper = (
+            instantiate(self.optim_conf.gradient_clip) if self.optim_conf else None
+        )
+        self.gradient_logger = (
+            instantiate(self.optim_conf.gradient_logger) if self.optim_conf else None
+        )
+
+        logging.info("Finished setting up components: Model, loss, optim, meters etc.")
+
+    def _construct_optimizers(self):
+        param_allowlist = None
+        if getattr(self.optim_conf, "param_allowlist_patterns", None):
+            param_names = dict(unwrap_ddp_if_wrapped(self.model).named_parameters())
+            param_allowlist = unix_param_pattern_to_parameter_names(
+                self.optim_conf.param_allowlist_patterns, param_names
+            )
+        self.optim = construct_optimizer(
+            self.model,
+            self.optim_conf.optimizer,
+            self.optim_conf.options,
+            self.optim_conf.param_group_modifiers,
+            param_allowlist=param_allowlist,
+        )
+
+    def _log_loss_detailed_and_return_core_loss(self, loss, loss_str, step):
+        core_loss = loss.pop(CORE_LOSS_KEY)
+        if step % self.logging_conf.log_scalar_frequency == 0:
+            for k in loss:
+                log_str = os.path.join(loss_str, k)
+                self.logger.log(log_str, loss[k], step)
+        return core_loss
+
+
+def print_model_summary(model: torch.nn.Module, log_dir: str = ""):
+    """
+    Prints the model and the number of parameters in the model.
+    # Multiple packages provide this info in a nice table format
+    # However, they need us to provide an `input` (as they also write down the output sizes)
+    # Our models are complex, and a single input is restrictive.
+    # https://github.com/sksq96/pytorch-summary
+    # https://github.com/nmhkahn/torchsummaryX
+    """
+    if get_rank() != 0:
+        return
+    param_kwargs = {}
+    trainable_parameters = sum(
+        p.numel() for p in model.parameters(**param_kwargs) if p.requires_grad
+    )
+    total_parameters = sum(p.numel() for p in model.parameters(**param_kwargs))
+    non_trainable_parameters = total_parameters - trainable_parameters
+    output_fpath = os.path.join(log_dir, "model.txt") if log_dir else ""
+    logging.info("==" * 10)
+    logging.info(f"Summary for model {type(model)}")
+    if output_fpath:
+        logging.info(f"Model structure saved to {output_fpath}")
+    else:
+        logging.info("Model structure file path not provided; skipping model dump.")
+    logging.info(f"\tTotal parameters {get_human_readable_count(total_parameters)}")
+    logging.info(
+        f"\tTrainable parameters {get_human_readable_count(trainable_parameters)}"
+    )
+    logging.info(
+        f"\tNon-Trainable parameters {get_human_readable_count(non_trainable_parameters)}"
+    )
+    logging.info("==" * 10)
+
+    if output_fpath:
+        with g_pathmgr.open(output_fpath, "w") as f:
+            print(model, file=f)
+
+
+PARAMETER_NUM_UNITS = [" ", "K", "M", "B", "T"]
+
+
+def get_human_readable_count(number: int) -> str:
+    """
+    Abbreviates an integer number with K, M, B, T for thousands, millions,
+    billions and trillions, respectively.
+    Examples:
+        >>> get_human_readable_count(123)
+        '123  '
+        >>> get_human_readable_count(1234)  # (one thousand)
+        '1.2 K'
+        >>> get_human_readable_count(2e6)   # (two million)
+        '2.0 M'
+        >>> get_human_readable_count(3e9)   # (three billion)
+        '3.0 B'
+        >>> get_human_readable_count(4e14)  # (four hundred trillion)
+        '400 T'
+        >>> get_human_readable_count(5e15)  # (more than trillion)
+        '5,000 T'
+    Args:
+        number: a positive integer number
+    Return:
+        A string formatted according to the pattern described above.
+    """
+    assert number >= 0
+    labels = PARAMETER_NUM_UNITS
+    num_digits = int(np.floor(np.log10(number)) + 1 if number > 0 else 1)
+    num_groups = int(np.ceil(num_digits / 3))
+    num_groups = min(num_groups, len(labels))  # don't abbreviate beyond trillions
+    shift = -3 * (num_groups - 1)
+    number = number * (10**shift)
+    index = num_groups - 1
+    if index < 1 or number >= 100:
+        return f"{int(number):,d} {labels[index]}"
+    else:
+        return f"{number:,.1f} {labels[index]}"

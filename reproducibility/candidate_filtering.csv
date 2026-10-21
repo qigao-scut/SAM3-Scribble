@@ -1,0 +1,7 @@
+model,dataset,slice_class_queries,candidates,threshold_discarded,retained,top1_discarded,selected,no_candidate,final_empty,volume_classes,empty_volume_classes,compared_slice_masks,different_slice_masks
+SAM3-Scribble,acdc,798,159600,158865,735,5,730,68,68,90,0,798,0
+SAM3-Scribble,btcv,4248,849600,848530,1070,86,984,3264,3264,24,0,4248,0
+SAM3-Scribble,promise12,795,159000,158528,472,11,461,334,334,30,0,795,0
+SAM3-Full,acdc,798,159600,158891,709,0,709,89,89,90,0,798,0
+SAM3-Full,btcv,4248,849600,848804,796,3,793,3455,3455,24,0,4248,0
+SAM3-Full,promise12,795,159000,158575,425,0,425,370,370,30,0,795,0

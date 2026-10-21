@@ -1,0 +1,7 @@
+model,dataset,volumes,volume_class_pairs,slices,interior_centers,positive_gt_triplet,absent_gt_center,single_slice_gap,isolated_false_positive,pairs_with_gap,pairs_with_isolated_fp,gap_percent,isolated_fp_percent
+SAM3-Scribble,acdc,30,90,798,618,545,14,0,0,0,0,0.0,0.0
+SAM3-Full,acdc,30,90,798,618,545,14,2,1,2,1,0.3669724770642202,7.142857142857143
+SAM3-Scribble,btcv,6,24,4248,4200,999,3153,6,2,4,2,0.6006006006006006,0.06343165239454487
+SAM3-Full,btcv,6,24,4248,4200,999,3153,19,3,13,3,1.901901901901902,0.09514747859181731
+SAM3-Scribble,promise12,30,30,795,735,358,320,0,2,0,2,0.0,0.625
+SAM3-Full,promise12,30,30,795,735,358,320,1,6,1,6,0.27932960893854747,1.875

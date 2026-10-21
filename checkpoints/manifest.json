@@ -1,0 +1,30 @@
+[
+  {
+    "model": "SAM3-Scribble",
+    "filename": "sam3_scribble_seed123.pt",
+    "size_bytes": 3483214347,
+    "sha256": "e8c31245e32e523f5c0cb3344ebb21126dfb92cbe7acabd12aec8c5ec2d09898",
+    "configured_seed": 123,
+    "format": "Training checkpoint containing the complete adapted model state",
+    "download_url": "https://pan.quark.cn/s/291caf207228",
+    "download_type": "shared_folder",
+    "host": "Quark Drive",
+    "requires_extraction_code": false,
+    "expiry": "no_expiry",
+    "bundled": false
+  },
+  {
+    "model": "SAM3-Full",
+    "filename": "sam3_full_seed123.pt",
+    "size_bytes": 3483214347,
+    "sha256": "d66a9f1e7ef24a8df08b1860b5e977597687bc8b9bea4c5452edd7055370f3ff",
+    "configured_seed": 123,
+    "format": "Training checkpoint containing the complete adapted model state",
+    "download_url": "https://pan.quark.cn/s/291caf207228",
+    "download_type": "shared_folder",
+    "host": "Quark Drive",
+    "requires_extraction_code": false,
+    "expiry": "no_expiry",
+    "bundled": false
+  }
+]

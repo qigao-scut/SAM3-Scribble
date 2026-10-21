@@ -1,0 +1,9 @@
+model,input_shape,unit,total_parameters_m,updated_parameters_in_study_m,forward_gflops,peak_allocated_gpu_gib,precision,torch_version,memory_status
+sam3_scribble,1x3x1008x1008,"one slice and one text prompt, uncached image/text encoding",848.161085,11.133192,6108.057911392,3.949756145477295,float32,2.9.1+cu126,completed
+sam3_full,1x3x1008x1008,"one slice and one text prompt, uncached image/text encoding",848.161085,11.133192,6108.057911392,3.949756145477295,float32,2.9.1+cu126,completed
+scribformer,1x1x256x256,"one slice, all classes, one network forward",47.915016,47.915016,89.85147392,0.3541417121887207,float32,2.4.1,completed
+effdnet,1x1x256x256,"one slice, all classes",1.814054,1.814054,5.937037312,0.03613710403442383,float32,2.9.1+cu126,completed
+nnunet,1x1x20x256x224,"one native 3D patch, all classes; excludes overlap/TTA",30.377428,30.377428,630.45828608,1.0992240905761719,float32,2.5.1,completed
+biomedparse,1x1x512x512,one 512x512 slice in native v2 image/text path,371.798778,0.0,8804.071650304,1.5793542861938477,float32,2.6.0+cu124,completed
+sat_pro,1x3x288x288x96,one native 3D patch and one cached text query; excludes overlap/TTA and text encoding,586.232064,0.0,54079.205332992,26.343770503997803,float32,2.8.0+cu128,completed
+voxtell,1x1x192x192x192,one native 3D patch and one cached text query; excludes overlap/TTA and text encoding,4461.803877,0.0,5057.43108096,7.470760345458984,float32,2.6.0+cu124,completed
