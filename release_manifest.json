@@ -1060,6 +1060,13 @@
       "transformed": true
     },
     {
+      "source": "gq_paper/cmpb/elsarticle_cmpb/framework.png",
+      "destination": "assets/framework.png",
+      "source_sha256": "e437ed0c29fd1c1141fd95b3d831b01a3db31aece8614c4d9b67dbbc437aa6b5",
+      "sha256": "e437ed0c29fd1c1141fd95b3d831b01a3db31aece8614c4d9b67dbbc437aa6b5",
+      "transformed": false
+    },
+    {
       "source": "sam3/train/configs/final/full_lora.yaml",
       "destination": "sam3/train/configs/final/full_lora.yaml",
       "source_sha256": "7956fabf87093ca577c9c84771a1b7ccf34db9c7ec870ad1a925a2d58b45166b",
@@ -1342,8 +1349,15 @@
     {
       "source": "reproducibility/release_templates/README.md",
       "destination": "README.md",
-      "source_sha256": "d1c9a6fa4d3f2205d5cdcea1f970d269464a46be58d07791ac43cef7c5cfc474",
-      "sha256": "d1c9a6fa4d3f2205d5cdcea1f970d269464a46be58d07791ac43cef7c5cfc474",
+      "source_sha256": "f5a1f6c1e661f322852d3a7efc22c1405c20bf2dd638e7cda5da8c379b25b4ad",
+      "sha256": "f5a1f6c1e661f322852d3a7efc22c1405c20bf2dd638e7cda5da8c379b25b4ad",
+      "transformed": false
+    },
+    {
+      "source": "reproducibility/release_templates/assets/hero.svg",
+      "destination": "assets/hero.svg",
+      "source_sha256": "761d214ea034e08155f103d80f22dfc802e14e597cb3488381132b27a712094f",
+      "sha256": "761d214ea034e08155f103d80f22dfc802e14e597cb3488381132b27a712094f",
       "transformed": false
     },
     {
